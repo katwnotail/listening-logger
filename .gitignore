@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .cache
 sample_response.json
+logs/

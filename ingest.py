@@ -1,21 +1,84 @@
+import logging
 import os
+import sys
+import time
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import mysql.connector
+import requests
 import spotipy
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyOAuth
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+log = logging.getLogger("ingest")
+
+
+class AuthError(Exception):
+    """The cached Spotify login is missing or can't be refreshed."""
+
+
+def setup_logging():
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = RotatingFileHandler(
+        LOG_DIR / "ingest.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(fmt)
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    log.addHandler(file_handler)
+    log.addHandler(console)
+
+
+def is_transient(exc):
+    """Errors worth retrying: network trouble and temporary server errors."""
+    if isinstance(exc, (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout)):
+        return True
+    if isinstance(exc, spotipy.SpotifyException):
+        return exc.http_status in (429, 500, 502, 503, 504)
+    if isinstance(exc, (mysql.connector.errors.InterfaceError,
+                        mysql.connector.errors.OperationalError)):
+        return True
+    return False
+
+
+def with_retries(func, what, attempts=3, base_delay=5):
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except Exception as exc:
+            if not is_transient(exc) or attempt == attempts:
+                raise
+            delay = base_delay * 2 ** (attempt - 1)
+            log.warning("%s failed (%s: %s); retrying in %ds (%d/%d)",
+                        what, type(exc).__name__, exc, delay, attempt, attempts - 1)
+            time.sleep(delay)
 
 
 def get_spotify():
-    return spotipy.Spotify(
-        auth_manager=SpotifyOAuth(
-            scope="user-read-recently-played",
-            cache_path=".cache",
-        )
+    auth = SpotifyOAuth(
+        scope="user-read-recently-played",
+        cache_path=str(BASE_DIR / ".cache"),
+        open_browser=False,  # never wait for a human during an unattended run
     )
+    try:
+        cached = auth.cache_handler.get_cached_token()
+        token = auth.validate_token(cached) if cached else None  # refreshes if expired
+    except Exception as exc:
+        raise AuthError(f"Token refresh failed: {exc}") from exc
+    if token is None:
+        raise AuthError("No valid Spotify token in cache. "
+                        "Run auth_test.py interactively to log in again.")
+    return spotipy.Spotify(auth_manager=auth)
 
 
 def get_db():
@@ -82,11 +145,14 @@ def save_play(cur, item):
     return cur.rowcount == 1  # 1 = new row, 0 = duplicate ignored
 
 
-def main():
+def run():
     sp = get_spotify()
-    items = sp.current_user_recently_played(limit=50)["items"]
+    items = with_retries(
+        lambda: sp.current_user_recently_played(limit=50)["items"],
+        "Spotify fetch",
+    )
 
-    conn = get_db()
+    conn = with_retries(get_db, "MySQL connect")
     cur = conn.cursor()
     new_plays = 0
     try:
@@ -95,15 +161,33 @@ def main():
                 new_plays += 1
         conn.commit()
     except Exception:
-        conn.rollback()
+        conn.rollback()  # all-or-nothing: next run re-fetches and retries safely
         raise
     finally:
         cur.close()
         conn.close()
 
-    print(f"Fetched {len(items)} plays, {new_plays} new, "
-          f"{len(items) - new_plays} already stored or skipped")
+    log.info("Fetched %d plays, %d new, %d already stored or skipped",
+             len(items), new_plays, len(items) - new_plays)
+    if len(items) == 50 and new_plays == 50:
+        log.warning("All 50 fetched plays were new. If this isn't the first run, "
+                    "plays may have been missed; run the logger more often.")
+
+
+def main():
+    setup_logging()
+    log.info("Run started")
+    try:
+        run()
+    except AuthError as exc:
+        log.error("Authentication problem: %s", exc)
+        return 1
+    except Exception:
+        log.exception("Run failed")
+        return 1
+    log.info("Run finished OK")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
