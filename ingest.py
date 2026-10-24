@@ -32,11 +32,11 @@ def setup_logging():
         LOG_DIR / "ingest.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(fmt)
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
     log.addHandler(file_handler)
-    log.addHandler(console)
-
+    if sys.stderr is not None:  # pythonw.exe has no console
+        console = logging.StreamHandler()
+        console.setFormatter(fmt)
+        log.addHandler(console)
 
 def is_transient(exc):
     """Errors worth retrying: network trouble and temporary server errors."""
